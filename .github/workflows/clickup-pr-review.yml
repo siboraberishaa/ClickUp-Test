@@ -1,0 +1,137 @@
+name: ClickUp PR Guardian
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  notify-clickup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── Extract CU task ID from branch name or PR title ──────────────────
+      # Supports both: feat/CU-86c91xxq4-setup or "feat: CU-86c91xxq4 setup"
+      - name: Extract ClickUp Task ID
+        id: cu
+        run: |
+          BRANCH="${{ github.head_ref }}"
+          TITLE="${{ github.event.pull_request.title }}"
+          # Try branch first, then title
+          TASK_ID=$(echo "$BRANCH $TITLE" | grep -oiE 'CU-[a-z0-9]+' | head -1 | tr '[:upper:]' '[:lower:]' | sed 's/cu-//')
+          if [ -z "$TASK_ID" ]; then
+            echo "❌ No CU- task ID found in branch name or PR title. Skipping."
+            echo "found=false" >> $GITHUB_OUTPUT
+          else
+            echo "found=true" >> $GITHUB_OUTPUT
+            echo "task_id=$TASK_ID" >> $GITHUB_OUTPUT
+            echo "✅ Found task ID: $TASK_ID"
+          fi
+
+      # ── Get PR diff (capped at 6000 chars to stay within ClickUp limits) ──
+      - name: Get PR diff
+        if: steps.cu.outputs.found == 'true'
+        id: diff
+        run: |
+          git fetch origin ${{ github.base_ref }}
+          RAW_DIFF=$(git diff origin/${{ github.base_ref }}...HEAD -- . ':(exclude)package-lock.json' ':(exclude)yarn.lock' | head -c 6000)
+          # Escape for JSON
+          ESCAPED=$(echo "$RAW_DIFF" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
+          echo "diff=$ESCAPED" >> $GITHUB_OUTPUT
+
+      # ── Get changed files list ────────────────────────────────────────────
+      - name: Get changed files
+        if: steps.cu.outputs.found == 'true'
+        id: files
+        run: |
+          FILES=$(git diff origin/${{ github.base_ref }}...HEAD --name-only | tr '\n' ', ' | sed 's/,$//')
+          echo "list=$FILES" >> $GITHUB_OUTPUT
+
+      # ── Post structured comment to ClickUp task ───────────────────────────
+      - name: Post to ClickUp
+        if: steps.cu.outputs.found == 'true'
+        env:
+          CLICKUP_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          TASK_ID: ${{ steps.cu.outputs.task_id }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_BASE: ${{ github.base_ref }}
+          PR_HEAD: ${{ github.head_ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          FILES: ${{ steps.files.outputs.list }}
+          DIFF: ${{ steps.diff.outputs.diff }}
+        run: |
+          python3 << 'EOF'
+          import os, json, urllib.request, urllib.error
+
+          task_id   = os.environ["TASK_ID"]
+          token     = os.environ["CLICKUP_TOKEN"]
+          pr_url    = os.environ["PR_URL"]
+          pr_title  = os.environ["PR_TITLE"]
+          pr_body   = os.environ["PR_BODY"] or "_No description provided._"
+          pr_author = os.environ["PR_AUTHOR"]
+          pr_base   = os.environ["PR_BASE"]
+          pr_head   = os.environ["PR_HEAD"]
+          pr_number = os.environ["PR_NUMBER"]
+          files     = os.environ["FILES"]
+          diff_raw  = json.loads(os.environ["DIFF"])  # unescape
+
+          comment = f"""🤖 **GitHub Action — PR Ready for Review**
+
+          ---
+          **PR:** [{pr_title}]({pr_url}) (#{pr_number})
+          **Author:** `{pr_author}`
+          **Branch:** `{pr_head}` → `{pr_base}`
+
+          ---
+          **📝 PR Description:**
+          {pr_body}
+
+          ---
+          **📁 Changed Files:**
+          ```
+          {files}
+          ```
+
+          ---
+          **🔍 Diff (first 6000 chars):**
+          ```diff
+          {diff_raw}
+          ```
+
+          ---
+          @Code Reviewer — please review the above PR against this task's acceptance criteria and run your baseline checks. Post your APPROVED / CHANGES REQUESTED verdict below.
+
+          🔗 Linked PR: {pr_url}
+          """
+
+          payload = json.dumps({
+              "comment_text": comment,
+              "notify_all": True
+          }).encode("utf-8")
+
+          url = f"https://api.clickup.com/api/v2/task/{task_id}/comment"
+          req = urllib.request.Request(
+              url,
+              data=payload,
+              headers={
+                  "Authorization": token,
+                  "Content-Type": "application/json"
+              },
+              method="POST"
+          )
+
+          try:
+              with urllib.request.urlopen(req) as res:
+                  print(f"✅ Comment posted to ClickUp task {task_id}. Status: {res.status}")
+          except urllib.error.HTTPError as e:
+              body = e.read().decode()
+              print(f"❌ ClickUp API error {e.code}: {body}")
+              exit(1)
+          EOF
